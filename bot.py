@@ -13,8 +13,15 @@ intents = discord.Intents.default()
 intents.message_content = True
 client = discord.Client(intents=intents)
 
-# ── Rarity detection ──────────────────────────────────────
 RARITIES = ["divine","prismatic","mythic","legendary","epic","rare","uncommon","common"]
+
+def clean_text(s):
+    """Remove Discord custom emojis like <:name:123456> and <a:name:123456>"""
+    s = re.sub(r'<a?:[^:]+:\d+>', '', s)   # custom emojis
+    s = re.sub(r'<t:\d+:[^>]*>', '', s)     # timestamps
+    s = re.sub(r'\*+', '', s)               # bold/italic markdown
+    s = re.sub(r'`+', '', s)               # code blocks
+    return s.strip()
 
 def detect_rarity(text):
     t = text.lower()
@@ -23,35 +30,59 @@ def detect_rarity(text):
             return r.capitalize()
     return "Common"
 
-# ── Parse "5x - Item Name" format ─────────────────────────
-def parse_item_string(s):
+def parse_item_line(raw):
     """
-    Input:  '5x - Rare Sprinkler'  OR  'Rare Sprinkler x5'  OR  'Sprinkler'
-    Output: {"name": "Sprinkler", "quantity": 5, "rarity": "Rare"}
+    Parses lines like:
+    '4x 🔦 - Flashbang'
+    '<:Flashbang:151513> - Flashbang'  
+    '3x 🥕 - Carrot'
+    'Carrot x3'
     """
-    s = s.strip()
-    
-    # Skip Discord timestamps and empty
-    if not s or "<t:" in s or "next stock" in s.lower():
+    s = clean_text(raw).strip()
+    if not s or len(s) < 2:
         return None
+    
+    # Skip header/footer lines
+    low = s.lower()
+    if any(skip in low for skip in [
+        'next stock', 'stock in', 'add me', 'grow a garden',
+        'gear stock', 'seed stock', 'egg stock', '---', '==='
+    ]):
+        return None
+
+    # Remove leading bullet/emoji chars
+    s = re.sub(r'^[-•*➤→✦·]\s*', '', s).strip()
 
     qty = 1
     name = s
 
-    # Match "5x - Item" or "5x Item"
-    m = re.match(r'^(\d+)[xX]\s*[-–]?\s*(.+)$', s)
+    # Pattern: "4x 🔦 - Flashbang" or "4x - Flashbang"
+    m = re.match(r'^(\d+)[xX]\s*(?:\S+\s*)?[-–]\s*(.+)$', s)
     if m:
         qty = int(m.group(1))
         name = m.group(2).strip()
     else:
-        # Match "Item x5" at end
+        # Pattern: "Flashbang x4" at end
         m2 = re.match(r'^(.+?)\s+[xX](\d+)$', s)
         if m2:
             name = m2.group(1).strip()
             qty = int(m2.group(2))
+        else:
+            # Pattern: "4x Flashbang" (no dash)
+            m3 = re.match(r'^(\d+)[xX]\s+(.+)$', s)
+            if m3:
+                qty = int(m3.group(1))
+                name = m3.group(2).strip()
+
+    # Clean any remaining emoji unicode from name
+    name = re.sub(r'[\U00010000-\U0010ffff]', '', name)  # unicode emojis
+    name = re.sub(r'\s+', ' ', name).strip(' -–')
+
+    if not name or len(name) < 2:
+        return None
 
     rarity = detect_rarity(name)
-    # Clean rarity word from name if present
+    # Remove rarity word from name
     for r in RARITIES:
         name = re.sub(r'(?i)\b' + r + r'\b', '', name).strip()
     name = re.sub(r'\s+', ' ', name).strip(' -–')
@@ -61,90 +92,106 @@ def parse_item_string(s):
 
     return {"name": name, "quantity": qty, "rarity": rarity}
 
-# ── Parse full Discord message ─────────────────────────────
+def detect_bucket(text):
+    """Detect if text is seeds/gear/eggs/event/weather section"""
+    t = text.lower()
+    if any(w in t for w in ["seed stock", "grow a garden stock", "🌱 stock", "seed shop"]):
+        return "seeds"
+    if any(w in t for w in ["gear stock", "tool stock", "⚙", "🔧"]):
+        return "gear"
+    if any(w in t for w in ["egg stock", "🥚"]):
+        return "eggs"
+    if any(w in t for w in ["event", "merchant", "special", "limited"]):
+        return "event"
+    if any(w in t for w in ["weather", "🌤", "⛈", "🌧", "☀", "🌙"]):
+        return "weather"
+    return None
+
 def parse_message(content, embeds):
     result = {
-        "seeds":      [],
-        "gear":       [],
-        "eggs":       [],
-        "event":      [],
-        "weather":    None,
+        "seeds": [], "gear": [], "eggs": [],
+        "event": [], "weather": None,
         "updated_at": datetime.now(timezone.utc).isoformat()
     }
     found = False
 
-    # ── Embed parsing ──
+    # ── Parse embeds ──────────────────────────────
     for emb in embeds:
-        title = (emb.title or "").lower()
-        desc  = emb.description or ""
-        all_text = desc
+        title = clean_text(emb.title or "")
+        desc  = clean_text(emb.description or "")
+        
+        # Detect bucket from title
+        bucket = detect_bucket(title)
+        
+        if bucket == "weather":
+            result["weather"] = title
+            found = True
+            continue
 
-        # Check fields too
+        # Parse embed fields
         for field in (emb.fields or []):
-            fname = (field.name or "").lower()
-            fval  = field.value or ""
-            all_text += "\n" + fval
-
-            bucket = None
-            if any(w in fname for w in ["seed","shop","plant"]):   bucket = "seeds"
-            elif any(w in fname for w in ["gear","tool","equip"]): bucket = "gear"
-            elif any(w in fname for w in ["egg","pet","hatch"]):   bucket = "eggs"
-            elif any(w in fname for w in ["event","special","merchant","limited"]): bucket = "event"
-            elif any(w in fname for w in ["weather","storm","rain","sun","moon"]): 
-                result["weather"] = field.value
+            fname = clean_text(field.name or "")
+            fval  = clean_text(field.value or "")
+            fb = detect_bucket(fname) or bucket
+            
+            if fb == "weather":
+                result["weather"] = fval
                 found = True
                 continue
-
-            if bucket:
+            if fb and fb in result:
                 for line in fval.split("\n"):
-                    item = parse_item_string(line)
+                    item = parse_item_line(line)
                     if item:
-                        result[bucket].append(item)
+                        result[fb].append(item)
                         found = True
 
-        # Bucket from embed title
-        bucket = None
-        if any(w in title for w in ["seed","shop","plant"]):   bucket = "seeds"
-        elif any(w in title for w in ["gear","tool","equip"]): bucket = "gear"
-        elif any(w in title for w in ["egg","pet","hatch"]):   bucket = "eggs"
-        elif any(w in title for w in ["event","special","merchant"]): bucket = "event"
-        elif any(w in title for w in ["weather","storm","rain","sun"]): 
-            result["weather"] = emb.title
-            found = True
-
-        if bucket and desc:
+        # Parse description lines
+        if bucket and bucket in result and desc:
             for line in desc.split("\n"):
-                item = parse_item_string(line)
+                item = parse_item_line(line)
                 if item:
                     result[bucket].append(item)
                     found = True
 
-    # ── Plain text fallback ──
-    if not found and content:
-        current_bucket = "seeds"
-        for line in content.split("\n"):
+        # No bucket from title - try each line as bucket detection
+        if not bucket and desc:
+            current = "seeds"
+            for line in desc.split("\n"):
+                line = line.strip()
+                if not line: continue
+                b = detect_bucket(line)
+                if b:
+                    current = b
+                    continue
+                item = parse_item_line(line)
+                if item and current in result:
+                    result[current].append(item)
+                    found = True
+
+    # ── Parse plain text ──────────────────────────
+    if content:
+        content_clean = clean_text(content)
+        current = None
+        for line in content_clean.split("\n"):
             line = line.strip()
             if not line: continue
-            lower = line.lower()
-
-            # Section headers
-            if any(w in lower for w in ["seed","🌱"]):   current_bucket = "seeds";  continue
-            if any(w in lower for w in ["gear","🔧"]):   current_bucket = "gear";   continue
-            if any(w in lower for w in ["egg","🥚"]):    current_bucket = "eggs";   continue
-            if any(w in lower for w in ["event","⭐"]): current_bucket = "event";  continue
-            if any(w in lower for w in ["weather","🌤","⛈","☀","🌧"]):
-                result["weather"] = line
-                found = True
+            
+            b = detect_bucket(line)
+            if b:
+                current = b if b != "weather" else None
+                if b == "weather":
+                    result["weather"] = line
+                    found = True
                 continue
-
-            item = parse_item_string(line)
-            if item:
-                result[current_bucket].append(item)
-                found = True
+            
+            if current and current in result:
+                item = parse_item_line(line)
+                if item:
+                    result[current].append(item)
+                    found = True
 
     return result if found else None
 
-# ── Send to WordPress ──────────────────────────────────────
 async def push(session, stock):
     try:
         async with session.post(
@@ -152,25 +199,36 @@ async def push(session, stock):
             json={"secret": WEBHOOK_SECRET, "stock": stock},
             timeout=aiohttp.ClientTimeout(total=10)
         ) as r:
+            body = await r.text()
             if r.status == 200:
-                print(f"[✓] Stock updated at {stock['updated_at']}")
+                total = sum(len(stock[k]) for k in ['seeds','gear','eggs','event'])
+                print(f"[✓] Pushed {total} items at {stock['updated_at']}")
             else:
-                print(f"[!] WordPress returned {r.status}: {await r.text()}")
+                print(f"[!] WordPress {r.status}: {body[:100]}")
     except Exception as e:
-        print(f"[✗] Push failed: {e}")
+        print(f"[✗] Push error: {e}")
 
-# ── Discord events ─────────────────────────────────────────
 @client.event
 async def on_ready():
     print(f"[✓] Bot online as {client.user}")
-    print(f"[✓] Watching channel: {CHANNEL_ID}")
+    print(f"[✓] Channel: {CHANNEL_ID}")
     ch = client.get_channel(CHANNEL_ID)
     if ch:
+        print("[*] Loading recent messages...")
         async with aiohttp.ClientSession() as s:
-            async for msg in ch.history(limit=10):
+            seeds_found = False
+            gear_found  = False
+            async for msg in ch.history(limit=20):
                 stock = parse_message(msg.content, msg.embeds)
                 if stock:
-                    await push(s, stock)
+                    # Merge — collect seeds from one msg, gear from another
+                    if stock['seeds'] and not seeds_found:
+                        await push(s, stock)
+                        seeds_found = True
+                    elif stock['gear'] and not gear_found:
+                        await push(s, stock)
+                        gear_found = True
+                if seeds_found and gear_found:
                     break
 
 @client.event
