@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 DISCORD_TOKEN   = os.environ.get("DISCORD_TOKEN", "YOUR_BOT_TOKEN_HERE")
 CHANNEL_ID      = int(os.environ.get("CHANNEL_ID", "0"))          # Stock channel ID
 WEBHOOK_URL     = os.environ.get("WEBHOOK_URL", "")               # Your WordPress PHP endpoint
-WEBHOOK_SECRET  = os.environ.get("WEBHOOK_SECRET", "9324081144123456") # Secret key for security
+WEBHOOK_SECRET  = os.environ.get("WEBHOOK_SECRET", "changeme987654-") # Secret key for security
 # ──────────────────────────────────────────────────────────
 
 intents = discord.Intents.default()
